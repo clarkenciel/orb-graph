@@ -1,5 +1,7 @@
-use std::collections::{HashMap};
+use std::collections::{HashMap,HashSet};
+use std::hash::{Hash, Hasher};
 
+#[derive(Clone)]
 struct Performer {
     id: PerformerId,
     heading: Heading,
@@ -12,13 +14,81 @@ impl Performer {
     fn hearing_areas(&self) -> (Sector, Sector) {}
 }
 
+impl PartialEq for Performer {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id
+    }
+}
+
+impl Eq for Performer {}
+
+impl Hash for Performer {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.id.hash(h);
+    }
+}
+
 type PerformerId = u64;
 
-type Performers = HashMap<PerformerId, Performer>;
+type Performers = HashSet<Performer>;
+
+struct PerformerIndex(HashMap<PerformerId, Performer>);
+
+impl PerformerIndex {
+    fn from(ps: &Performers) -> Self {
+        PerformerIndex(ps.iter().map(|&p| (p.id, p.clone())).collect())
+    }
+}
 
 struct PerformerGraph {
     edges: HashMap<PerformerId, Edges>,
-    performers: Performers, // feels like a big redundancy
+}
+
+impl PerformerGraph {
+    fn new() -> Self {
+        Self { edges: HashMap::new() }
+    }
+
+    fn connections_count(&self) -> u64 {
+        self.edges.values().map(|es| es.count()).sum()
+    }
+
+    fn connect(&mut self, c: &Connection) {
+        match (self.edges.get_mut(&c.source), self.edges.get_mut(&c.sink)) {
+            (None, None) => {
+                self.edges.insert(c.source, Edges {
+                    ears: Ears(Slots::empty()),
+                    mouth: Mouth(Slots::with(&c.source_side, &c.sink)),
+                });
+
+                self.edges.insert(c.sink, Edges {
+                    mouth: Mouth(Slots::empty()),
+                    ears: Ears(Slots::with(&c.sink_side, &c.source)),
+                });
+            },
+
+            (Some(Edges { mouth: Mouth(slots), .. }), None) => {
+                slots.add(&c.source_side, &c.sink);
+                self.edges.insert(c.sink, Edges {
+                    mouth: Mouth(Slots::empty()),
+                    ears: Ears(Slots::with(&c.sink_side, &c.source)),
+                });
+            }
+
+            (None, Some(Edges { ears: Ears(slots), .. })) => {
+                slots.add(&c.sink_side, &c.source);
+                self.edges.insert(c.source, Edges {
+                    ears: Ears(Slots::empty()),
+                    mouth: Mouth(Slots::with(&c.source_side, &c.sink)),
+                });
+            },
+
+            (Some(Edges { mouth: Mouth(m_slots), .. }), Some(Edges { ears: Ears(e_slots), .. })) => {
+                e_slots.add(&c.sink_side, &c.source);
+                m_slots.add(&c.source_side, &c.sink);
+            },
+        }
+    }
 }
 
 struct Slots {
@@ -27,11 +97,42 @@ struct Slots {
 }
 
 impl Slots {
+    fn empty() -> Self {
+        Self { left: None, right: None }
+    }
+
+    fn with(s: &Side, p: &PerformerId) -> Self {
+        match s {
+            Side::Left => Self { left: Some(p.clone()), right: None },
+            Side::Right => Self { right: Some(p.clone()), left: None },
+        }
+    }
+
     fn available_on(&self, s: &Side) -> bool {
         match s {
             Side::Left => self.left.is_none(),
             Side::Right => self.right.is_none(),
         }
+    }
+
+    fn add(&mut self, s: &Side, p: &PerformerId) {
+        match s {
+            Side::Left => self.left = Some(p.clone()),
+            Side::Right => self.right = Some(p.clone()),
+        };
+    }
+
+    fn has(&self, p: &PerformerId) -> bool {
+        match (self.right, self.left) {
+            (None, None) => false,
+            (Some(p2), None) => *p == p2,
+            (None, Some(p2)) => *p == p2,
+            (Some(p2), Some(p3)) => *p == p2 || *p == p3,
+        }
+    }
+
+    fn filled(&self) -> u64 {
+        self.left.map(|_| 1).unwrap_or(0) + self.right.map(|_| 1).unwrap_or(0)
     }
 }
 
@@ -40,9 +141,39 @@ struct Edges {
     mouth: Mouth,
 }
 
+impl Edges {
+    fn count(&self) -> u64 {
+        self.ears.speakers() + self.mouth.listeners()
+    }
+}
+
 struct Mouth(Slots);
 
+impl Mouth {
+    fn talking_to(&self, p: &PerformerId) -> bool {
+        let Mouth(slots) = self;
+        slots.has(p)
+    }
+
+    fn listeners(&self) -> u64 {
+        let Mouth(slots) = self;
+        slots.filled()
+    }
+}
+
 struct Ears(Slots);
+
+impl Ears {
+    fn listening_to(&self, p: &PerformerId) -> bool {
+        let Ears(slots) = self;
+        slots.has(p)
+    }
+
+    fn speakers(&self) -> u64 {
+        let Ears(slots) = self;
+        slots.filled()
+    }
+}
 
 enum Side {
     Left,
@@ -62,9 +193,8 @@ trait Source {
 
 impl Source for Mouth {
     fn output_free(&self, s: &Side) -> bool {
-        match self {
-            Mouth(slots) => slots.available_on(s),
-        }
+        let Mouth(slots) = self;
+        slots.available_on(s)
     }
 }
 
@@ -96,12 +226,22 @@ fn possible_connections(cs: Vec<Connection>, edges: &HashMap<PerformerId, Edges>
 //   2. source exists, has an available mouth slot and sink does not exist
 //   3. sink exists, has an available ear slot and source does not exist
 //   4. source and sink exist, connection can connect them
+// *NB* I think checking `talking_to` and `listening_to` is overkill; if
+//      a performer isn't `talking_to` another performer, the other performer
+//      _shouldn't_ be `listening_to` the source, but.....
 fn connection_is_possible(c: &Connection, edges: &HashMap<PerformerId, Edges>) -> bool {
     match (edges.get(&c.source), edges.get(&c.sink)) {
         (None, None) => true,
-        (Some(source), None) => source.mouth.output_free(&c.source_side),
-        (None, Some(sink)) => sink.ears.input_free(&c.sink_side),
-        (Some(source), Some(sink)) => c.can_connect(&source.mouth, &sink.ears),
+        (Some(source), None) =>
+            !source.mouth.talking_to(&c.sink) &&
+            source.mouth.output_free(&c.source_side),
+        (None, Some(sink)) =>
+            !sink.ears.listening_to(&c.source) &&
+            sink.ears.input_free(&c.sink_side),
+        (Some(source), Some(sink)) =>
+            !source.mouth.talking_to(&c.sink) &&
+            !sink.ears.listening_to(&c.source) &&
+            c.can_connect(&source.mouth, &sink.ears),
     }
 }
 
@@ -164,6 +304,7 @@ impl Sector {
     }
 }
 
+#[derive(Clone)]
 struct Position(f64, f64);
 
 impl Position {
@@ -202,4 +343,27 @@ impl Vector {
     }
 }
 
+#[derive(Clone)]
 struct Heading(f64);
+
+// intuitively, this should be float, but i know that floats
+// are kind of a pain in rust vis a vis sorting, so here we are!
+type Score = u64;
+
+type ScoredGraph = (PerformerGraph, Score);
+
+fn evaluate(ps: &Performers) -> Option<ScoredGraph> {
+    let index = PerformerIndex::from(ps);
+    ps.iter()
+        .flat_map(|p| graphs(p, &index).iter().map(|&g| (g, g.connections_count())))
+        .max_by_key(|&(_, c)| c)
+}
+
+fn graphs(start: &Performer, index: &PerformerIndex) -> Vec<PerformerGraph> {
+    vec![]
+}
+
+fn build_graph(start: &Performer, index: &PerformerIndex) -> PerformerGraph {
+    let mut graph = PerformerGraph::new();
+    graph
+}
